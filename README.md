@@ -2,13 +2,13 @@
 
 # Real-Time Fraud Detection System
 
-**A production-grade ML pipeline for financial transaction fraud detection at scale**
+**A demonstration prototype of a real-time ML pipeline for financial transaction fraud detection, trained on synthetic data**
 
 ---
 
 ## Abstract
 
-This project presents an end-to-end real-time fraud detection system designed for financial transaction processing. The system combines streaming data ingestion via Apache Kafka, a gradient-boosted classification model (XGBoost), and a low-latency inference API (FastAPI) to deliver sub-3ms prediction latency at 600+ requests per second. Key engineering contributions include a principled approach to extreme class imbalance (0.5% fraud rate), a 30-feature behavioral engineering pipeline, and a production-ready microservices architecture with full observability. The system achieves 85% precision and 80% recall on held-out test data, with a PR-AUC of 0.75—significantly above the random baseline appropriate for severely imbalanced datasets.
+This project presents a demonstration prototype of a real-time fraud detection system for financial transaction processing. The system combines streaming data ingestion via Apache Kafka, a gradient-boosted classification model (XGBoost), and an inference API (FastAPI). Key engineering contributions include an approach to extreme class imbalance (0.5% fraud rate), a 30-feature behavioral engineering pipeline, and a Docker Compose infrastructure with Prometheus and Grafana configured as a datasource. On synthetic data, the model reaches precision and recall of 0.70 on a test set containing only 10 frauds; this figure is indicative, not a measure of production performance. I also wrote an asynchronous load-test harness, but no latency or throughput results from an actual run are documented.
 
 ---
 
@@ -16,7 +16,7 @@ This project presents an end-to-end real-time fraud detection system designed fo
 
 Fraud detection in financial systems presents a unique confluence of challenges: extreme class imbalance, strict latency constraints, the need for interpretable decisions, and adversarial adaptation by malicious actors. A model that naively predicts every transaction as legitimate achieves 99.5% accuracy while catching zero frauds—a stark illustration of why standard accuracy metrics are inadequate for this domain.
 
-This system was designed to address all these challenges simultaneously, treating fraud detection not as a pure machine learning problem but as a full-stack engineering discipline. The goal was to build something that could plausibly run in production: streaming ingestion, real-time serving, persistent audit trails, and operational monitoring—not just an offline notebook.
+This system was designed to address all these challenges simultaneously, treating fraud detection not as a pure machine learning problem but as a full-stack engineering discipline. The goal was to build a prototype that goes beyond an offline notebook: streaming ingestion, real-time serving, a persistence schema for audit trails, and monitoring infrastructure.
 
 The rest of this document is organized as follows: §2 describes the system architecture and data flow; §3 covers feature engineering; §4 details the model design and training methodology; §5 presents the API design and performance characteristics; §6 covers infrastructure and MLOps practices; §7 reports empirical results.
 
@@ -26,7 +26,7 @@ The rest of this document is organized as follows: §2 describes the system arch
 
 ### 2.1 Overview
 
-The system follows a microservices architecture orchestrated with Docker Compose, comprising six independent services that communicate via Apache Kafka and a shared PostgreSQL instance.
+The system is a demonstration prototype with a Docker Compose infrastructure. The Compose file starts the supporting services (ZooKeeper, Kafka, PostgreSQL, Prometheus, Redis, Grafana); the API and the Kafka consumer are run separately as Python processes. Redis is declared as an optional container but is not used by the code.
 
 ```
 ┌─────────────────────┐
@@ -44,13 +44,13 @@ The system follows a microservices architecture orchestrated with Docker Compose
          ▼                               ▼
 ┌─────────────────────────────────────────────────┐
 │                  PostgreSQL                     │
-│  predictions · model_metrics · fraud_alerts     │
-│  feature_store · ab_test_results                │
+│  predictions (written by the consumer)          │
+│  other tables: schema only, not populated       │
 └──────────────────────┬──────────────────────────┘
                        │
           ┌────────────▼────────────┐
           │  Prometheus + Grafana   │
-          │  (metrics & dashboards) │
+          │  (Grafana: datasource)  │
           └─────────────────────────┘
 ```
 
@@ -131,11 +131,11 @@ With a 0.5% fraud rate, class imbalance is the central modeling challenge. Three
 
 | Strategy | Approach | Trade-off |
 |----------|----------|-----------|
-| `scale_pos_weight` | Weight fraud class by `(1 - fraud_rate) / fraud_rate ≈ 199` | Simplest; no data modification; used in production |
+| `scale_pos_weight` | Weight fraud class by `(1 - fraud_rate) / fraud_rate ≈ 199` | Simplest; no data modification; used in this prototype |
 | SMOTE oversampling | Synthesize minority-class neighbors | Higher recall; memory-intensive for large datasets |
 | Random undersampling | Reduce majority class | Fast; discards potentially useful data |
 
-The `scale_pos_weight` approach was selected for production. It operates at the loss function level, giving fraud samples 199x the gradient contribution of normal samples, without altering the training set distribution or introducing synthetic samples that may not reflect real fraud patterns.
+The `scale_pos_weight` approach was selected. It operates at the loss function level, giving fraud samples 199x the gradient contribution of normal samples, without altering the training set distribution or introducing synthetic samples that may not reflect real fraud patterns.
 
 ### 4.3 Model Configuration
 
@@ -157,7 +157,7 @@ XGBClassifier(
 
 **Why PR-AUC, not ROC-AUC**: ROC-AUC is misleading under extreme imbalance because it treats true negatives (the abundant class) symmetrically with true positives. A classifier with poor recall can achieve high ROC-AUC simply by correctly classifying the majority class. Precision-Recall AUC focuses on the minority class performance, making it the appropriate primary metric.
 
-Evaluation uses 5-fold stratified cross-validation, preserving class ratios in each fold. The confusion matrix is interpreted in business terms:
+Evaluation uses a stratified train/test split with early stopping, preserving class ratios in both partitions. The confusion matrix is interpreted in business terms:
 - **False Positive Rate**: Customer friction (legitimate transactions blocked).
 - **False Negative Rate**: Financial loss (frauds missed).
 
@@ -201,25 +201,15 @@ Risk levels (`low` / `medium` / `high` / `critical`) map probability thresholds 
 
 **Model Singleton Caching**: The `ModelLoader` class implements the Singleton pattern. The first call to `get_model()` deserializes the XGBoost artifact and the feature engineer from disk (~100ms), subsequent calls return the cached in-memory object. This prevents per-request deserialization overhead.
 
-**Async I/O**: FastAPI's async request handlers allow concurrent request processing without thread-per-request overhead. I/O-bound operations (database writes, health checks) yield the event loop while waiting, enabling higher throughput on a single process.
+**Async I/O**: FastAPI's async request handlers allow concurrent request processing without thread-per-request overhead. I/O-bound operations (such as health checks) yield the event loop while waiting, enabling higher throughput on a single process.
 
 **Batch Vectorization**: Sequential prediction of 100 transactions takes approximately 100ms; a vectorized batch of 100 takes approximately 15ms—a 6.7× speedup from eliminating Python loop overhead and leveraging XGBoost's native batch inference.
 
 **Hot Model Reload**: The `/admin/reload` endpoint atomically swaps the in-memory model reference. New requests transparently use the updated model without service interruption, supporting zero-downtime model updates.
 
-### 5.4 Measured Performance
+### 5.4 Performance
 
-Load testing with 4 Uvicorn workers (locust + asyncio):
-
-| Metric | Target | Achieved |
-|--------|--------|---------|
-| P50 latency | < 50ms | < 1ms |
-| P95 latency | < 50ms | < 3ms |
-| P99 latency | < 50ms | < 4ms |
-| Throughput | 500 RPS | 600+ RPS |
-| Success rate | 99.9% | 99.8% |
-
-The system exceeds all latency targets by more than an order of magnitude, largely due to the in-memory model singleton and XGBoost's efficient tree traversal.
+I wrote an asynchronous load-test harness (`scripts/load_test_api.py`), but no results from an actual run are stored, so this README reports no latency or throughput figures. Numbers should be re-run and saved before being cited.
 
 ---
 
@@ -227,20 +217,20 @@ The system exceeds all latency targets by more than an order of magnitude, large
 
 ### 6.1 Data Persistence Schema
 
-Five PostgreSQL tables form the persistence layer:
+Five PostgreSQL tables are defined in the schema. Only `predictions` is written by the code (by the streaming consumer; the API does not write to the database). Drift detection, an alert system and MLflow experiment tracking are not implemented.
 
-- **`predictions`**: Every model decision, with timestamp, probability, latency, and model version. Enables offline analysis, drift detection, and regulatory audit.
-- **`model_metrics`**: Periodic performance snapshots (precision, recall, PR-AUC). Powers Grafana dashboards and triggers for model retraining.
-- **`fraud_alerts`**: High-confidence fraud cases (probability > threshold) queued for manual review workflows.
-- **`feature_store`**: Cached engineered features for consistency between training and serving, and for feature sharing across future models.
-- **`ab_test_results`**: Per-request model assignment and outcome data for controlled model comparison experiments.
+- **`predictions`**: Every model decision, with timestamp, probability, latency, and model version. Enables offline analysis of the model's decisions.
+- **`model_metrics`**: Periodic performance snapshots (precision, recall, PR-AUC). Schema only; not populated by the code.
+- **`fraud_alerts`**: Schema only; no alerting system is implemented.
+- **`feature_store`**: Schema only; not populated by the code.
+- **`ab_test_results`**: Schema only; see §6.4.
 
 ### 6.2 Observability Stack
 
 Three observability layers are instrumented:
 
 1. **Infrastructure**: Docker health checks and restart policies ensure service availability.
-2. **Platform**: `prometheus-fastapi-instrumentator` automatically instruments all endpoints with request count, latency histograms, and in-flight request gauges. Prometheus scrapes every 15 seconds; Grafana renders real-time dashboards.
+2. **Platform**: `prometheus-fastapi-instrumentator` automatically instruments all endpoints with request count, latency histograms, and in-flight request gauges. Prometheus scrapes every 15 seconds; Grafana is configured with Prometheus as a datasource, but no dashboards are included.
 3. **Application**: Custom business metrics expose fraud rate, model version in use, and prediction latency percentiles—decoupled from HTTP-level metrics and tied to business semantics.
 
 Request tracing assigns a UUID to every inbound request, propagated via `X-Request-ID` response headers and embedded in all log lines, enabling correlation across services.
@@ -251,9 +241,9 @@ Request tracing assigns a UUID to every inbound request, propagated via `X-Reque
 - **Graceful Shutdown**: Signal handlers for `SIGINT`/`SIGTERM` allow in-flight requests to complete before process exit.
 - **Structured Logging**: `loguru` with JSON-compatible output enables log aggregation and querying in production log systems.
 
-### 6.4 A/B Testing Infrastructure
+### 6.4 A/B Testing
 
-The `ab_test_results` table and associated API logic support gradual traffic splitting between model versions. Statistical significance is computed from stored per-experiment precision/recall data, supporting evidence-based model promotion without full traffic commitment.
+Schema prepared, not implemented: the `ab_test_results` and `ab_tests` tables exist, but there is no traffic-assignment logic.
 
 ---
 
@@ -261,19 +251,18 @@ The `ab_test_results` table and associated API logic support gradual traffic spl
 
 ### 7.1 Model Performance
 
+Measured on synthetic data, on a test set containing only 10 frauds. The figures are indicative, not a measure of production performance.
+
 | Metric | Value |
 |--------|-------|
-| Precision | 85% |
-| Recall | 80% |
-| F1-Score | 82.5% |
-| PR-AUC | 0.75 |
-| ROC-AUC | 0.92 |
+| Precision | 0.70 |
+| Recall | 0.70 |
+| PR-AUC | 0.63 |
+| ROC-AUC | 0.97 |
 
-### 7.2 Business Metrics
+### 7.2 Interpretation
 
-- **False Positive Rate**: 2% (legitimate transactions incorrectly blocked, creating customer friction)
-- **False Negative Rate**: 20% (fraudulent transactions incorrectly approved, representing financial exposure)
-- **Fraud Detection Rate**: 80% of all fraud transactions are intercepted
+With a recall of 0.70 on 10 frauds, 3 frauds were missed (false negatives = financial exposure). With so few positive examples, a single transaction shifts these figures substantially.
 
 ### 7.3 Top Predictive Features
 
@@ -303,7 +292,7 @@ This ordering reinforces the value of behavioral (user-level) features over glob
 git clone <repo-url>
 cd fraud-detection-system
 
-# Start all services (Kafka, PostgreSQL, API, Prometheus, Grafana)
+# Start the infrastructure (ZooKeeper, Kafka, PostgreSQL, Prometheus, Redis, Grafana)
 docker-compose up -d
 
 # Verify services are healthy
@@ -315,7 +304,7 @@ python scripts/collect_training_data.py
 # Train the model
 python src/models/train.py
 
-# Run a prediction
+# Run a prediction (requires the API to be started separately: it is not part of the Compose file)
 curl -X POST http://localhost:8000/predict \
   -H "Content-Type: application/json" \
   -d '{
@@ -375,7 +364,7 @@ fraud-detection-system/
 
 ## 10. Conclusion
 
-This system demonstrates that production-grade fraud detection requires engineering depth across multiple disciplines simultaneously: the statistics of imbalanced classification, the distributed systems concerns of streaming pipelines, the software engineering principles of reliable API design, and the operational discipline of observability and zero-downtime deployment.
+This prototype illustrates that fraud detection requires engineering depth across multiple disciplines simultaneously: the statistics of imbalanced classification, the distributed systems concerns of streaming pipelines, the software engineering principles of reliable API design, and the operational discipline of observability.
 
 The core technical insight is that *feature engineering and class imbalance handling matter more than algorithm selection*. A well-tuned XGBoost model with behavioral deviation features and appropriate class weighting outperforms a naive deep learning approach on this problem class, while being orders of magnitude faster to serve and easier to explain.
 
