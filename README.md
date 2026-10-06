@@ -59,7 +59,7 @@ The system is a demonstration prototype with a Docker Compose infrastructure. Th
 Transactions enter the system via a Kafka producer that generates synthetic records at 100+ transactions per second, simulating realistic behavioral patterns including five distinct fraud archetypes (high-value outliers, late-night anomalies, rapid sequential transactions, cross-border anomalies, and compromised merchant patterns).
 
 Two parallel consumption paths exist:
-- **Streaming path**: A Kafka consumer reads from the topic, invokes the ML pipeline in-process, and persists predictions to PostgreSQL with at-least-once delivery semantics (manual offset commit post-write).
+- **Streaming path**: A Kafka consumer reads from the topic, invokes the ML pipeline in-process, and persists predictions to PostgreSQL. Offsets are committed manually after each message, but a failed database write is only logged and the offset is still committed, so delivery is best-effort, not at-least-once. The insert is idempotent (`ON CONFLICT DO NOTHING`), so adding retries would be safe.
 - **Synchronous path**: A REST API accepts individual or batch transaction payloads for real-time predictions from upstream services.
 
 ### 2.3 Technology Choices
@@ -77,7 +77,7 @@ Two parallel consumption paths exist:
 
 ## 3. Feature Engineering
 
-Raw transactions arrive with nine fields: `transaction_id`, `user_id`, `amount`, `merchant`, `merchant_category`, `timestamp`, `location_country`, `device_type`, and `is_fraud`. From these, the pipeline engineers 30+ features across five categories.
+Raw transactions arrive with nine fields: `transaction_id`, `user_id`, `amount`, `merchant`, `merchant_category`, `timestamp`, `location_country`, `device_type`, and `is_fraud`. From these, the pipeline engineers 31 features across five categories.
 
 ### 3.1 Temporal Features
 
@@ -205,7 +205,7 @@ Risk levels (`low` / `medium` / `high` / `critical`) map probability thresholds 
 
 **Batch Vectorization**: Sequential prediction of 100 transactions takes approximately 100ms; a vectorized batch of 100 takes approximately 15ms—a 6.7× speedup from eliminating Python loop overhead and leveraging XGBoost's native batch inference.
 
-**Hot Model Reload**: The `/admin/reload` endpoint atomically swaps the in-memory model reference. New requests transparently use the updated model without service interruption, supporting zero-downtime model updates.
+**Hot Model Reload**: The `/admin/reload` endpoint reloads the model and feature engineer from disk without restarting the service. It is unauthenticated, so it is a convenience for local use, not something to expose.
 
 ### 5.4 Performance
 
@@ -237,7 +237,7 @@ Request tracing assigns a UUID to every inbound request, propagated via `X-Reque
 
 ### 6.3 Reliability
 
-- **At-Least-Once Delivery**: Kafka consumers use manual offset commits, committing only after successful database write. A consumer crash mid-processing results in message replay, not loss.
+- **Delivery semantics**: Kafka consumers use manual offset commits, but the commit happens after every message even when the database write failed (errors are caught and logged). A crash before the commit causes replay; a failed write does not. Making write errors propagate and committing only on success would give true at-least-once.
 - **Graceful Shutdown**: Signal handlers for `SIGINT`/`SIGTERM` allow in-flight requests to complete before process exit.
 - **Structured Logging**: `loguru` with JSON-compatible output enables log aggregation and querying in production log systems.
 
@@ -371,6 +371,21 @@ The core technical insight is that *feature engineering and class imbalance hand
 The system is intentionally over-engineered relative to its toy dataset—its value is as a blueprint for production ML systems, not as a fraud model trained on synthetic data.
 
 ---
+
+## Limits and next steps
+
+**Limits**
+- All data is synthetic, produced by the project's own generator, so the model has never seen real fraud patterns.
+- The metrics come from a test set with only 10 fraudulent transactions (precision and recall 0.70): they are indicative and say little about real-world performance.
+- The model was trained locally with a minimal setup, enough to get a reasonable baseline for the prototype, not tuned.
+- Kafka runs as a single broker, and the producer, consumer and API are started by hand rather than orchestrated.
+- Database saves in the streaming consumer are best-effort: a failed write is logged and the offset is still committed.
+- There are no automated tests and no recorded load test.
+
+**Next steps**
+- Make save errors propagate and commit offsets only on success (true at-least-once), with a dead letter topic for records that keep failing.
+- Add a test suite and keep a load-test run as evidence.
+- Evaluate on a larger labeled set and report confidence intervals.
 
 ## License
 
