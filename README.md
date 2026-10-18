@@ -2,13 +2,15 @@
 
 # Real-Time Fraud Detection System
 
-**A demonstration prototype of a real-time ML pipeline for financial transaction fraud detection, trained on synthetic data**
+**A real-time ML pipeline for financial transaction fraud detection, trained on synthetic data**
+
+Part of RiskSentinel: this is the fraud-detection component; the event-driven payment layer is described in [kafka-payment-architecture](https://github.com/fabiofasc/kafka-payment-architecture).
 
 ---
 
 ## Abstract
 
-This project presents a demonstration prototype of a real-time fraud detection system for financial transaction processing. The system combines streaming data ingestion via Apache Kafka, a gradient-boosted classification model (XGBoost), and an inference API (FastAPI). Key engineering contributions include an approach to extreme class imbalance (0.5% fraud rate), a 30-feature behavioral engineering pipeline, and a Docker Compose infrastructure with Prometheus and Grafana configured as a datasource. On synthetic data, the model reaches precision and recall of 0.70 on a test set containing only 10 frauds; this figure is indicative, not a measure of production performance. I also wrote an asynchronous load-test harness, but no latency or throughput results from an actual run are documented.
+This project presents a real-time fraud detection system for financial transaction processing. The system combines streaming data ingestion via Apache Kafka, a gradient-boosted classification model (XGBoost), and an inference API (FastAPI). Key engineering contributions include an approach to extreme class imbalance (0.5% fraud rate), a 31-feature behavioral engineering pipeline, and a Docker Compose infrastructure with Prometheus and Grafana configured as a datasource. On synthetic data, the model reaches precision and recall of 0.70 on a test set containing only 10 frauds; this figure is indicative, not a measure of production performance. I also wrote an asynchronous load-test harness, but no latency or throughput results from an actual run are documented.
 
 ---
 
@@ -122,7 +124,7 @@ XGBoost was selected over alternatives (LightGBM, Random Forest, logistic regres
 
 1. **Tabular data performance**: Gradient-boosted trees consistently outperform deep learning on structured tabular features with moderate dataset sizes.
 2. **Class imbalance support**: The `scale_pos_weight` hyperparameter directly addresses class imbalance without requiring data resampling.
-3. **Inference speed**: Single-record predictions execute in under 1ms in-process, meeting latency requirements without batching.
+3. **Inference speed**: Gradient-boosted trees score a single record in-process without batching. Latency has not been measured with a stored run (see §5).
 4. **Interpretability**: SHAP-compatible feature importances support regulatory and operational explainability requirements.
 
 ### 4.2 Handling Extreme Class Imbalance
@@ -161,7 +163,7 @@ Evaluation uses a stratified train/test split with early stopping, preserving cl
 - **False Positive Rate**: Customer friction (legitimate transactions blocked).
 - **False Negative Rate**: Financial loss (frauds missed).
 
-The optimal decision threshold is set at 0.4 for the streaming path (slightly favoring recall) and 0.5 for the synchronous API (balanced precision/recall), reflecting different downstream cost structures.
+The decision threshold is 0.4 for single-transaction scoring, used by both the streaming consumer and the `/predict` endpoint (slightly favoring recall: a missed fraud costs more than a false alarm), and 0.5 for the batch endpoint.
 
 ---
 
@@ -298,7 +300,7 @@ docker-compose up -d
 # Verify services are healthy
 docker-compose ps
 
-# Collect training data (runs producer for ~5 minutes)
+# Collect training data from the Kafka topic (the producer must be running)
 python scripts/collect_training_data.py
 
 # Train the model
@@ -366,9 +368,9 @@ fraud-detection-system/
 
 This prototype illustrates that fraud detection requires engineering depth across multiple disciplines simultaneously: the statistics of imbalanced classification, the distributed systems concerns of streaming pipelines, the software engineering principles of reliable API design, and the operational discipline of observability.
 
-The core technical insight is that *feature engineering and class imbalance handling matter more than algorithm selection*. A well-tuned XGBoost model with behavioral deviation features and appropriate class weighting outperforms a naive deep learning approach on this problem class, while being orders of magnitude faster to serve and easier to explain.
+The core technical insight is that *feature engineering and class imbalance handling matter more than algorithm selection*. An XGBoost model with behavioral deviation features and class weighting is a sound fit for this kind of tabular problem: fast to serve and easy to explain. No comparison with other model families was run.
 
-The system is intentionally over-engineered relative to its toy dataset—its value is as a blueprint for production ML systems, not as a fraud model trained on synthetic data.
+The architecture goes beyond what the synthetic dataset needs: its purpose is to show the full path from streaming ingestion to a served model, not to offer a fraud model ready for real data.
 
 ---
 
